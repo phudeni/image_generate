@@ -1,0 +1,154 @@
+
+
+import os
+from pathlib import Path
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from tqdm.auto import tqdm
+from accelerate import Accelerator
+from diffusers import StableDiffusionPipeline, DDPMScheduler
+from peft import LoraConfig, get_peft_model
+from torch.optim import AdamW
+
+# ======= Config =======
+model_name = "runwayml/stable-diffusion-v1-5"
+train_folder = "/kaggle/input/images/archive/Images"  # Your dataset path
+output_dir = "/kaggle/working/trendmorph_img"
+os.makedirs(output_dir, exist_ok=True)
+
+rank = 4
+resolution = 512  # Set 256 for faster but lower quality
+batch_size = 1   # Set max batch your GPU can handle
+learning_rate = 1e-6
+epochs = 3
+
+# ======= Preprocessing =======
+preprocess = transforms.Compose([
+    transforms.Resize((resolution, resolution)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3),
+])
+
+# ======= Dataset class =======
+class ImageCaptionDataset(Dataset):
+    def __init__(self, folder, tokenizer, max_images=None):
+        self.folder = Path(folder)
+        self.tokenizer = tokenizer
+        all_images = sorted(self.folder.glob("*.jpg"))
+        self.images = [img for img in all_images if (img.with_suffix(".txt")).exists()]
+        
+        if max_images is not None:
+            self.images = self.images[:max_images]
+        
+        print(f"Total images found: {len(all_images)}")
+        print(f"Images with captions: {len(self.images)}")
+        print(f"Images skipped due to missing captions: {len(all_images) - len(self.images)}")
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        txt_path = img_path.with_suffix(".txt")
+
+        image = Image.open(img_path).convert("RGB")
+        image = preprocess(image)
+
+        with open(txt_path, "r") as f:
+            captions = f.read().splitlines()
+        caption = captions[0] if captions else ""
+
+        tokens = self.tokenizer(
+            caption,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        return {
+            "pixel_values": image,
+            "input_ids": tokens.input_ids.squeeze(0),
+            "attention_mask": tokens.attention_mask.squeeze(0),
+        }
+
+# ======= Load pipeline and models =======
+print("Loading Stable Diffusion pipeline...")
+pipe = StableDiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.float32)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+pipe.to(device)
+
+tokenizer = pipe.tokenizer
+unet = pipe.unet
+vae = pipe.vae
+text_encoder = pipe.text_encoder
+
+# Freeze UNet params for LoRA training
+for param in unet.parameters():
+    param.requires_grad = False
+
+# ======= Setup LoRA =======
+lora_config = LoraConfig(
+    r=rank,
+    lora_alpha=16,
+    target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+    lora_dropout=0.05,
+    bias="none"
+)
+unet = get_peft_model(unet, lora_config)
+
+# ======= Training setup =======
+trainable_params = [p for p in unet.parameters() if p.requires_grad]
+print(f"Trainable params: {sum(p.numel() for p in trainable_params):,}")
+
+dataset = ImageCaptionDataset(train_folder, tokenizer)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+noise_scheduler = DDPMScheduler.from_pretrained(model_name, subfolder="scheduler")
+
+# Enable mixed precision training (fp16) for speed
+accelerator = Accelerator(mixed_precision="fp16")
+optimizer = AdamW(trainable_params, lr=learning_rate)
+
+unet, optimizer, dataloader = accelerator.prepare(unet, optimizer, dataloader)
+
+# ======= Training Loop =======
+unet.train()
+for epoch in range(epochs):
+    progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
+    for step, batch in enumerate(progress_bar):
+        with accelerator.accumulate(unet):
+            pixel_values = batch["pixel_values"].to(accelerator.device)
+            input_ids = batch["input_ids"].to(accelerator.device)
+
+            encoder_hidden_states = text_encoder(input_ids)[0]
+
+            with torch.no_grad():
+                latents = vae.encode(pixel_values).latent_dist.sample()
+                latents = latents * 0.18215
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps,
+                (latents.size(0),), device=latents.device
+            ).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            loss = torch.nn.functional.mse_loss(model_pred, noise, reduction="mean")
+
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            progress_bar.set_postfix({"loss": loss.item()})
+
+# ======= Save final LoRA weights =======
+accelerator.wait_for_everyone()
+final_dir = os.path.join(output_dir, "final_lora")
+os.makedirs(final_dir, exist_ok=True)
+accelerator.unwrap_model(unet).save_pretrained(final_dir)
+print(f"✅ Training complete! LoRA weights saved at: {final_dir}")
