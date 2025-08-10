@@ -1,5 +1,3 @@
-
-
 import os
 from pathlib import Path
 from PIL import Image
@@ -14,13 +12,13 @@ from torch.optim import AdamW
 
 # ======= Config =======
 model_name = "runwayml/stable-diffusion-v1-5"
-train_folder = "/kaggle/input/images/archive/Images"  # Your dataset path
+train_folder = "/kaggle/input/images/archive/Images"  
 output_dir = "/kaggle/working/trendmorph_img"
 os.makedirs(output_dir, exist_ok=True)
 
 rank = 4
-resolution = 512  # Set 256 for faster but lower quality
-batch_size = 1   # Set max batch your GPU can handle
+resolution = 512  
+batch_size = 1   
 learning_rate = 1e-6
 epochs = 3
 
