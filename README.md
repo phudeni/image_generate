@@ -1,1 +1,1 @@
-# image_generate
+# Image Generation with Stable Diffusion & LoRA Fine-Tuning
